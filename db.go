@@ -552,6 +552,7 @@ type IteratorOptions struct {
 	TableName string
 	IndexName string
 	Reverse   bool
+	Update    bool
 	Begin     []interface{}
 	End       []interface{}
 	BeforeRun func()
@@ -571,7 +572,11 @@ func (this *DB) EachItem(opt IteratorOptions) error {
 	}
 	begin := getIndexDataPrefix(index.config.ID, opt.Begin)
 	end := getIndexDataPrefix(index.config.ID, append(opt.End, orderedcode.Infinity))
-	return this.View(func(txn *badger.Txn) error {
+	trans := this.View
+	if opt.Update {
+		trans = this.Update
+	}
+	return trans(func(txn *badger.Txn) error {
 		badgerOpt := badger.DefaultIteratorOptions
 		badgerOpt.Reverse = opt.Reverse
 		iter := txn.NewIterator(badgerOpt)
@@ -601,6 +606,56 @@ func (this *DB) EachItem(opt IteratorOptions) error {
 				return err
 			}
 			stop, err := opt.Callback(itemData)
+			if err != nil {
+				return err
+			}
+			if stop {
+				return nil
+			}
+		}
+		return nil
+	}, opt.BeforeRun)
+}
+
+func (this *DB) EachIndex(opt IteratorOptions) error {
+	this.tableLock.RLock()
+	defer this.tableLock.RUnlock()
+	table, ok := this.tables[opt.TableName]
+	if !ok {
+		return ErrTableNotExists
+	}
+	index, ok := table.indexes[opt.IndexName]
+	if !ok {
+		return ErrIndexNotExists
+	}
+	begin := getIndexDataPrefix(index.config.ID, opt.Begin)
+	end := getIndexDataPrefix(index.config.ID, append(opt.End, orderedcode.Infinity))
+	trans := this.View
+	if opt.Update {
+		trans = this.Update
+	}
+	return trans(func(txn *badger.Txn) error {
+		badgerOpt := badger.DefaultIteratorOptions
+		badgerOpt.Reverse = opt.Reverse
+		iter := txn.NewIterator(badgerOpt)
+		defer iter.Close()
+		if opt.Reverse {
+			iter.Seek(end)
+		} else {
+			iter.Seek(begin)
+		}
+		for ; iter.Valid(); iter.Next() {
+			item := iter.Item()
+			if badgerOpt.Reverse {
+				if bytes.Compare(item.Key(), begin) == -1 {
+					return nil
+				}
+			} else {
+				if bytes.Compare(item.Key(), end) == 1 {
+					return nil
+				}
+			}
+			stop, err := opt.Callback(item)
 			if err != nil {
 				return err
 			}

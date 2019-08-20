@@ -1,8 +1,8 @@
 package badgerquery
 
 import (
-	"github.com/1lann/msgpack"
 	"github.com/dgraph-io/badger"
+	"github.com/vmihailenco/msgpack"
 )
 
 func DecodeIndexConfig(b []byte) (*IndexConfig, error) {
