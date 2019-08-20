@@ -11,6 +11,8 @@ var (
 	ErrTableNotExists = errors.New("table not exists")
 
 	ErrIndexNotExists = errors.New("index not exists")
+
+	ErrItemExists = errors.New("item already exists")
 )
 
 type MultiError struct {

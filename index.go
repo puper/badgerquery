@@ -20,8 +20,8 @@ type IndexConfig struct {
 	TableName string
 	ID        uint64
 	Name      string
-	Unique    bool
-	Deleted   bool
+	Unique    bool // not used now
+	Deleted   bool // not used now
 }
 
 type Index struct {

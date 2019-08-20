@@ -23,6 +23,8 @@ type DB struct {
 }
 
 func (this *DB) loadMeta() error {
+	this.tableLock.Lock()
+	defer this.tableLock.Unlock()
 	err := this.db.View(func(txn *badger.Txn) error {
 		var (
 			err error
@@ -130,6 +132,7 @@ func (this *DB) CreateTable(tableName string, indexConfigs map[string]*IndexConf
 	return nil
 }
 
+// not safe
 func (this *DB) CreateItem(item Item) error {
 	this.tableLock.RLock()
 	defer this.tableLock.RUnlock()
@@ -139,6 +142,7 @@ func (this *DB) CreateItem(item Item) error {
 	return err
 }
 
+// not safe
 func (this *DB) UpdateItem(item Item) error {
 	this.tableLock.RLock()
 	defer this.tableLock.RUnlock()
@@ -148,6 +152,7 @@ func (this *DB) UpdateItem(item Item) error {
 	return err
 }
 
+// safe
 func (this *DB) SaveItem(item Item) error {
 	this.tableLock.RLock()
 	defer this.tableLock.RUnlock()
@@ -168,6 +173,7 @@ func (this *DB) SaveItem(item Item) error {
 	return err
 }
 
+// safe
 func (this *DB) DeleteItem(tableName string, itemKey string) error {
 	this.tableLock.RLock()
 	defer this.tableLock.RUnlock()
@@ -181,7 +187,7 @@ func (this *DB) DeleteItem(tableName string, itemKey string) error {
 	return err
 }
 
-func (this *DB) GetItem(tableName string, item Item) error {
+func (this *DB) GetItem(itemKey string, item Item) error {
 	this.tableLock.RLock()
 	defer this.tableLock.RUnlock()
 	table, ok := this.tables[item.TableName()]
@@ -189,7 +195,7 @@ func (this *DB) GetItem(tableName string, item Item) error {
 		return ErrTableNotExists
 	}
 	err := this.View(func(txn *badger.Txn) error {
-		err := this.getItemData(txn, table.config.DataID, item.Key(), item)
+		err := this.getItemData(txn, table.config.DataID, itemKey, item)
 		return err
 	}, nil)
 	return err
@@ -241,13 +247,21 @@ func (this *DB) createItem(txn *badger.Txn, item Item) error {
 		return err
 	}
 	itemIndexes := this.getCurrentItemIndexes(table, item)
-	for _, indexData := range itemIndexes {
-		err = this.addIndexData(txn, itemKey, indexData)
+	for indexName, indexData := range itemIndexes {
+		index, ok := table.indexes[indexName]
+		if !ok {
+			continue
+		}
+		seq, err := this.NextID(index.seq)
+		if err != nil {
+			return err
+		}
+		err = this.addIndexData(txn, itemKey, mustEncodeOrderedCode(indexData, seq))
 		if err != nil {
 			return err
 		}
 	}
-	err = this.setItemIndexes(txn, tableIndexID, itemKey, this.getCurrentItemIndexes(table, item))
+	err = this.setItemIndexes(txn, tableIndexID, itemKey, itemIndexes)
 	return err
 }
 
@@ -281,24 +295,30 @@ func (this *DB) updateItem(txn *badger.Txn, item Item) error {
 	oldItemIndexes, err := this.getItemIndexes(txn, tableIndexID, itemKey)
 	if err == badger.ErrKeyNotFound {
 		oldItemIndexes = ItemIndexes{}
-	} else {
+	} else if err != nil {
 		return err
 	}
 	currentItemIndexes := this.getCurrentItemIndexes(table, item)
-	err = this.setItemIndexes(txn, tableIndexID, itemKey, currentItemIndexes)
-	if err != nil {
-		return err
-	}
 	for indexName, currentIndexData := range currentItemIndexes {
+		index, ok := table.indexes[indexName]
+		if !ok {
+			continue
+		}
 		if oldIndexData, ok := oldItemIndexes[indexName]; !ok {
-			this.addIndexData(txn, itemKey, currentIndexData)
+			seq, err := this.NextID(index.seq)
+			if err != nil {
+				return err
+			}
+			this.addIndexData(txn, itemKey, mustEncodeOrderedCode(currentIndexData, seq))
 		} else {
 			delete(oldItemIndexes, indexName)
-			/**
-			@TODO tmd 这个是加了seq后缀，最后一个int不会相等，一定会新增. parse 几个都不知道，只有item自己知道
-			*/
-			if !bytes.Equal(oldIndexData, currentIndexData) {
-				err = this.addIndexData(txn, itemKey, currentIndexData)
+			currentIndexDataMax := mustEncodeOrderedCode(currentIndexData, orderedcode.Infinity)
+			if bytes.Compare(oldIndexData, currentIndexDataMax) == 1 || bytes.Compare(oldIndexData, currentIndexData) == -1 {
+				seq, err := this.NextID(index.seq)
+				if err != nil {
+					return err
+				}
+				err = this.addIndexData(txn, itemKey, mustEncodeOrderedCode(currentIndexData, seq))
 				if err != nil {
 					return err
 				}
@@ -306,6 +326,7 @@ func (this *DB) updateItem(txn *badger.Txn, item Item) error {
 				if err != nil && err != badger.ErrKeyNotFound {
 					return err
 				}
+			} else {
 			}
 		}
 	}
@@ -314,6 +335,10 @@ func (this *DB) updateItem(txn *badger.Txn, item Item) error {
 		if err != nil && err != badger.ErrKeyNotFound {
 			return err
 		}
+	}
+	err = this.setItemIndexes(txn, tableIndexID, itemKey, currentItemIndexes)
+	if err != nil {
+		return err
 	}
 	return nil
 }
@@ -386,20 +411,13 @@ func (this *DB) deleteItemIndexes(txn *badger.Txn, tableIndexID uint64, itemKey 
 	return err
 }
 
+// 如果索引没变，没必要生成seq
 func (this *DB) getItemIndex(index *Index, item Item) ([]byte, error) {
 	indexData, err := item.Index(index.config.Name)
 	if err != nil {
 		return nil, err
 	}
-	if index.config.Unique {
-		return getIndexDataKey(index.config.ID, indexData, 0), nil
-	} else {
-		seq, err := this.NextID(index.seq)
-		if err != nil {
-			return nil, err
-		}
-		return getIndexDataKey(index.config.ID, indexData, seq), nil
-	}
+	return getIndexDataPrefix(index.config.ID, indexData), nil
 }
 
 func (this *DB) getCurrentItemIndexes(table *Table, item Item) ItemIndexes {
@@ -536,11 +554,11 @@ type IteratorOptions struct {
 	Reverse   bool
 	Begin     []interface{}
 	End       []interface{}
+	BeforeRun func()
 	Callback  func(*badger.Item) (bool, error)
 }
 
-// callback 需要返回是否中止迭代.
-func (this *DB) Each(opt IteratorOptions) error {
+func (this *DB) EachItem(opt IteratorOptions) error {
 	this.tableLock.RLock()
 	defer this.tableLock.RUnlock()
 	table, ok := this.tables[opt.TableName]
@@ -553,8 +571,6 @@ func (this *DB) Each(opt IteratorOptions) error {
 	}
 	begin := getIndexDataPrefix(index.config.ID, opt.Begin)
 	end := getIndexDataPrefix(index.config.ID, append(opt.End, orderedcode.Infinity))
-	log.Println(begin)
-	log.Println(end)
 	return this.View(func(txn *badger.Txn) error {
 		badgerOpt := badger.DefaultIteratorOptions
 		badgerOpt.Reverse = opt.Reverse
@@ -576,7 +592,15 @@ func (this *DB) Each(opt IteratorOptions) error {
 					return nil
 				}
 			}
-			stop, err := opt.Callback(item)
+			var itemData *badger.Item
+			err := item.Value(func(val []byte) (err error) {
+				itemData, err = txn.Get(getItemDataKey(table.config.DataID, string(val)))
+				return
+			})
+			if err != nil {
+				return err
+			}
+			stop, err := opt.Callback(itemData)
 			if err != nil {
 				return err
 			}
@@ -585,5 +609,5 @@ func (this *DB) Each(opt IteratorOptions) error {
 			}
 		}
 		return nil
-	}, nil)
+	}, opt.BeforeRun)
 }
