@@ -5,7 +5,6 @@ import (
 	"log"
 	"runtime"
 	"strconv"
-	"sync"
 
 	"time"
 
@@ -44,14 +43,21 @@ func main() {
 	runtime.GOMAXPROCS(128)
 	opt := badger.DefaultOptions("test1")
 	opt.SyncWrites = false
-	db, err := badgerquery.Open(opt)
+	db, err := badgerquery.Open(opt, badgerquery.Options{
+		GCFreq:   100 * time.Millisecond,
+		SyncFreq: 100 * time.Millisecond,
+	})
 	defer db.Close()
 	log.Println(db, err)
+	db.Test()
+	/**
 	err = db.CreateTable("test", map[string]*badgerquery.IndexConfig{
 		"index1": &badgerquery.IndexConfig{
 			Unique: true,
 		},
 	})
+	*/
+	/**
 	var wg1 sync.WaitGroup
 	wg1.Add(5)
 	go func() {
@@ -82,7 +88,6 @@ func main() {
 		err = db.DeleteItem("test", strconv.Itoa(i))
 	}
 	fmt.Printf("%v\n", time.Now().Sub(start))
-	*/
 	item := &Test{
 		A: 999,
 	}
@@ -119,6 +124,7 @@ func main() {
 	wg.Wait()
 	fmt.Printf("%v\n", time.Now().Sub(start))
 	log.Println(err, item)
+	*/
 
 }
 

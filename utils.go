@@ -19,6 +19,18 @@ func mustEncodeOrderedCode(buf []byte, items ...interface{}) []byte {
 	return reply
 }
 
+func DecodeIndexData(buf []byte, items ...interface{}) error {
+	var (
+		indexID uint64
+	)
+	remain, err := orderedcode.Parse(string(buf), &indexID)
+	if err != nil {
+		return err
+	}
+	_, err = orderedcode.Parse(remain, items)
+	return err
+}
+
 func getMetaSeqKey() []byte {
 	return metaSeqKey
 }
@@ -59,5 +71,11 @@ func getIndexDataKey(indexID uint64, indexData []interface{}, seq uint64) []byte
 	reply := mustEncodeOrderedCode(nil, indexID)
 	reply = mustEncodeOrderedCode(reply, indexData...)
 	reply = mustEncodeOrderedCode(reply, seq)
+	return reply
+}
+
+func getIndexDataPrefix(indexID uint64, indexData []interface{}) []byte {
+	reply := mustEncodeOrderedCode(nil, indexID)
+	reply = mustEncodeOrderedCode(reply, indexData...)
 	return reply
 }

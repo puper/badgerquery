@@ -1,6 +1,17 @@
 package badgerquery
 
-import "strings"
+import (
+	"errors"
+	"strings"
+)
+
+var (
+	ErrDBClosed       = errors.New("db already closed")
+	ErrTableExists    = errors.New("table already exists")
+	ErrTableNotExists = errors.New("table not exists")
+
+	ErrIndexNotExists = errors.New("index not exists")
+)
 
 type MultiError struct {
 	errors []error

@@ -7,7 +7,7 @@ import (
 type Item interface {
 	Key() string
 	TableName() string
-	Index(indexName string) ([]interface{}, error)
+	Index(string) ([]interface{}, error)
 	Marshal() []byte
 	Unmarshal([]byte) error
 }

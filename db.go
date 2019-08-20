@@ -2,14 +2,24 @@ package badgerquery
 
 import (
 	"bytes"
+	"context"
+	"log"
+	"sync"
+	"time"
+
+	"github.com/google/orderedcode"
 
 	"github.com/dgraph-io/badger"
 )
 
 type DB struct {
-	tables map[string]*Table
-	db     *badger.DB
-	seq    *badger.Sequence
+	tableLock sync.RWMutex
+	tables    map[string]*Table
+	db        *badger.DB
+	seq       *badger.Sequence
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
 }
 
 func (this *DB) loadMeta() error {
@@ -62,6 +72,11 @@ func (this *DB) loadMeta() error {
 }
 
 func (this *DB) CreateTable(tableName string, indexConfigs map[string]*IndexConfig) error {
+	this.tableLock.Lock()
+	defer this.tableLock.Unlock()
+	if _, ok := this.tables[tableName]; ok {
+		return ErrTableExists
+	}
 	tableConfig := &TableConfig{}
 	indexes := map[string]*Index{}
 	err := this.Update(func(txn *badger.Txn) error {
@@ -116,6 +131,8 @@ func (this *DB) CreateTable(tableName string, indexConfigs map[string]*IndexConf
 }
 
 func (this *DB) CreateItem(item Item) error {
+	this.tableLock.RLock()
+	defer this.tableLock.RUnlock()
 	err := this.Update(func(txn *badger.Txn) error {
 		return this.createItem(txn, item)
 	}, nil)
@@ -123,15 +140,22 @@ func (this *DB) CreateItem(item Item) error {
 }
 
 func (this *DB) UpdateItem(item Item) error {
+	this.tableLock.RLock()
+	defer this.tableLock.RUnlock()
 	err := this.Update(func(txn *badger.Txn) error {
 		return this.updateItem(txn, item)
 	}, nil)
 	return err
 }
 
-func (this *DB) Save(item Item) error {
+func (this *DB) SaveItem(item Item) error {
+	this.tableLock.RLock()
+	defer this.tableLock.RUnlock()
+	table, ok := this.tables[item.TableName()]
+	if !ok {
+		return ErrTableNotExists
+	}
 	err := this.Update(func(txn *badger.Txn) error {
-		table := this.tables[item.TableName()]
 		has, err := this.hasItem(txn, table.config.DataID, item.Key())
 		if err != nil {
 			return err
@@ -145,16 +169,26 @@ func (this *DB) Save(item Item) error {
 }
 
 func (this *DB) DeleteItem(tableName string, itemKey string) error {
+	this.tableLock.RLock()
+	defer this.tableLock.RUnlock()
+	table, ok := this.tables[tableName]
+	if !ok {
+		return ErrTableNotExists
+	}
 	err := this.Update(func(txn *badger.Txn) error {
-		table := this.tables[tableName]
 		return this.deleteItem(txn, table, itemKey)
 	}, nil)
 	return err
 }
 
 func (this *DB) GetItem(tableName string, item Item) error {
+	this.tableLock.RLock()
+	defer this.tableLock.RUnlock()
+	table, ok := this.tables[item.TableName()]
+	if !ok {
+		return ErrTableNotExists
+	}
 	err := this.View(func(txn *badger.Txn) error {
-		table := this.tables[tableName]
 		err := this.getItemData(txn, table.config.DataID, item.Key(), item)
 		return err
 	}, nil)
@@ -162,12 +196,17 @@ func (this *DB) GetItem(tableName string, item Item) error {
 }
 
 func (this *DB) HasItem(tableName string, itemKey string) (bool, error) {
+	this.tableLock.RLock()
+	defer this.tableLock.RUnlock()
+	table, ok := this.tables[tableName]
+	if !ok {
+		return false, ErrTableNotExists
+	}
 	var (
 		has bool
 		err error
 	)
 	this.View(func(txn *badger.Txn) error {
-		table := this.tables[tableName]
 		has, err = this.hasItem(txn, table.config.DataID, itemKey)
 		return err
 	}, nil)
@@ -190,7 +229,10 @@ func (this *DB) createItem(txn *badger.Txn, item Item) error {
 		err error
 	)
 	tableName := item.TableName()
-	table := this.tables[tableName]
+	table, ok := this.tables[tableName]
+	if !ok {
+		return ErrTableNotExists
+	}
 	tableDataID := table.config.DataID
 	tableIndexID := table.config.IndexID
 	itemKey := item.Key()
@@ -225,6 +267,10 @@ func (this *DB) updateItem(txn *badger.Txn, item Item) error {
 	)
 	tableName := item.TableName()
 	table := this.tables[tableName]
+	table, ok := this.tables[tableName]
+	if !ok {
+		return ErrTableNotExists
+	}
 	tableDataID := table.config.DataID
 	tableIndexID := table.config.IndexID
 	itemKey := item.Key()
@@ -248,6 +294,9 @@ func (this *DB) updateItem(txn *badger.Txn, item Item) error {
 			this.addIndexData(txn, itemKey, currentIndexData)
 		} else {
 			delete(oldItemIndexes, indexName)
+			/**
+			@TODO tmd 这个是加了seq后缀，最后一个int不会相等，一定会新增. parse 几个都不知道，只有item自己知道
+			*/
 			if !bytes.Equal(oldIndexData, currentIndexData) {
 				err = this.addIndexData(txn, itemKey, currentIndexData)
 				if err != nil {
@@ -365,52 +414,21 @@ func (this *DB) getCurrentItemIndexes(table *Table, item Item) ItemIndexes {
 	return itemIndexes
 }
 
-func (this *DB) xxx(item Item) error {
-	err := this.Update(func(txn *badger.Txn) error {
-		table := this.tables[item.TableName()]
-		itemDataKey := getItemDataKey(table.config.DataID, item.Key())
-		_, err := txn.Get(itemDataKey)
-		if err != badger.ErrKeyNotFound {
-			return err
-		}
-		itemIndexKey := getItemIndexKey(table.config.IndexID, item.Key())
-		err = txn.Set(itemDataKey, item.Marshal())
-		if err != nil {
-			return err
-		}
-		itemIndexes := ItemIndexes{}
-		for indexName, index := range table.indexes {
-			indexData, err := item.Index(indexName)
-			if err != nil {
-				continue
-			}
-			seq, err := this.NextID(index.seq)
-			if err != nil {
-				return err
-			}
-			indexKey := getIndexDataKey(index.config.ID, indexData, seq)
-			err = txn.Set(indexKey, []byte(item.Key()))
-			if err != nil {
-				return err
-			}
-			itemIndexes[indexName] = indexKey
-		}
-		if len(itemIndexes) > 0 {
-			err := txn.Set(itemIndexKey, itemIndexes.Marshal())
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	}, nil)
-	return err
-}
-
 func (this *DB) Close() error {
+	this.tableLock.Lock()
+	defer this.tableLock.Unlock()
+	if this.db == nil {
+		return nil
+	}
 	this.seq.Release()
 	for _, table := range this.tables {
 		table.Close()
 	}
+	//  停止gc，sync
+	this.cancel()
+	this.wg.Wait()
+	this.db.Close()
+	this.db = nil
 	return nil
 }
 
@@ -480,18 +498,92 @@ func (this *DB) NextID(seq *badger.Sequence) (uint64, error) {
 	return reply, err
 }
 
-func (this *DB) Test() {
-	this.db.View(func(txn *badger.Txn) error {
-		opt := badger.DefaultIteratorOptions
-		opt.Prefix = getIndexDataKeyBase(this.tables["test"].indexes["index1"].config.ID)
-		iter := txn.NewIterator(opt)
+func (this *DB) gcLoop(freq time.Duration) {
+	defer this.wg.Done()
+	tk := time.NewTicker(freq)
+	for {
+		select {
+		case <-tk.C:
+			err := this.db.RunValueLogGC(0.5)
+			if err != nil && err != badger.ErrNoRewrite {
+				log.Println("gcLoop: ", err.Error())
+			}
+		case <-this.ctx.Done():
+			return
+		}
+	}
+}
+
+func (this *DB) syncLoop(freq time.Duration) {
+	defer this.wg.Done()
+	tk := time.NewTicker(freq)
+	for {
+		select {
+		case <-tk.C:
+			err := this.db.Sync()
+			if err != nil {
+				log.Println("syncLoop: ", err.Error())
+			}
+		case <-this.ctx.Done():
+			return
+		}
+	}
+}
+
+type IteratorOptions struct {
+	TableName string
+	IndexName string
+	Reverse   bool
+	Begin     []interface{}
+	End       []interface{}
+	Callback  func(*badger.Item) (bool, error)
+}
+
+// callback 需要返回是否中止迭代.
+func (this *DB) Each(opt IteratorOptions) error {
+	this.tableLock.RLock()
+	defer this.tableLock.RUnlock()
+	table, ok := this.tables[opt.TableName]
+	if !ok {
+		return ErrTableNotExists
+	}
+	index, ok := table.indexes[opt.IndexName]
+	if !ok {
+		return ErrIndexNotExists
+	}
+	begin := getIndexDataPrefix(index.config.ID, opt.Begin)
+	end := getIndexDataPrefix(index.config.ID, append(opt.End, orderedcode.Infinity))
+	log.Println(begin)
+	log.Println(end)
+	return this.View(func(txn *badger.Txn) error {
+		badgerOpt := badger.DefaultIteratorOptions
+		badgerOpt.Reverse = opt.Reverse
+		iter := txn.NewIterator(badgerOpt)
 		defer iter.Close()
-		for iter.Rewind(); iter.ValidForPrefix(opt.Prefix); iter.Next() {
-			iter.Item().Value(func(val []byte) error {
-				//log.Println(iter.Item().Key(), val)
+		if opt.Reverse {
+			iter.Seek(end)
+		} else {
+			iter.Seek(begin)
+		}
+		for ; iter.Valid(); iter.Next() {
+			item := iter.Item()
+			if badgerOpt.Reverse {
+				if bytes.Compare(item.Key(), begin) == -1 {
+					return nil
+				}
+			} else {
+				if bytes.Compare(item.Key(), end) == 1 {
+					return nil
+				}
+			}
+			stop, err := opt.Callback(item)
+			if err != nil {
+				return err
+			}
+			if stop {
 				return nil
-			})
+			}
 		}
 		return nil
-	})
+	}, nil)
 }
